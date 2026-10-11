@@ -85,6 +85,7 @@ public final class WLDevice {
 
     // Callbacks, always delivered on the main queue.
     public var onTX: ((String, Any?, Int) -> Void)?          // method, params, id
+    public var pilotBudgetState:PilotRequestBudget.State? {pilotBudget?.state}
     public var onResponse: ((Int, Any?, String?) -> Void)?   // id, result, errorMessage
     public var onNotification: ((String, Any?) -> Void)?     // method, params
     public var onDeviceLog: ((String) -> Void)?
@@ -267,7 +268,7 @@ public final class WLDevice {
     }
 
     @discardableResult
-    public func callReportingRPCError(_ method: String, params: Any?, rpcErrorCode: ((Int?)->Void)?, completion: ((Any?, String?) -> Void)? = nil) -> Int? {
+    public func callReportingRPCError(_ method: String, params: Any?, rpcErrorCode: ((Int?)->Void)?, reserving:Int=0, completion: ((Any?, String?) -> Void)? = nil) -> Int? {
         guard emulatedConnected || device != nil else {
             completion?(nil, Failure.notConnected.errorDescription)
             return nil
@@ -277,7 +278,8 @@ public final class WLDevice {
         let generation=connectionGeneration,ticket=UUID()
         let id:Int
         if let pilotBudget {
-            guard let allocated=pilotBudget.allocate() else {
+            guard let allocated=pilotBudget.allocate(reserving:reserving) else {
+                if reserving>0 {completion?(nil,"pilot cleanup reserve reached");return nil}
                 completion?(nil,"pilot request budget exhausted");disconnect(reason:"pilot request budget exhausted");return nil
             }
             id=allocated

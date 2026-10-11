@@ -38,11 +38,19 @@ public final class PilotRequestBudget {
     private let clock:()->Double
     public convenience init() {self.init(limit:256,lifetime:60,clock:{ProcessInfo.processInfo.systemUptime})}
     init(limit:Int,lifetime:Double,clock:@escaping ()->Double) {self.limit=min(limit,998);self.lifetime=lifetime;self.clock=clock}
+    public struct State {public let deadline:Double,remainingRequests:Int}
+    /// Read-only process budget; reconnecting never resets IDs or lifetime.
+    public var state:State {
+        lock.lock();defer {lock.unlock()}
+        let now=clock(),start=started ?? now
+        let valid=now.isFinite && start.isFinite && now>=start && now-start<lifetime
+        return State(deadline:start+lifetime,remainingRequests:valid ? max(0,limit-next+1):0)
+    }
     private let lock=NSLock()
-    func allocate() -> Int? {
+    func allocate(reserving:Int=0) -> Int? {
         lock.lock();defer {lock.unlock()}
         let now=clock();if started==nil {started=now}
-        guard now>=started!, now-started!<lifetime, next<=limit else {return nil}
+        guard reserving>=0,now>=started!, now-started!<lifetime, next<=limit-reserving else {return nil}
         defer {next+=1};return next
     }
 }

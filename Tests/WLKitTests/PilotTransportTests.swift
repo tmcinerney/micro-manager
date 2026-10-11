@@ -106,4 +106,23 @@ final class PilotTransportTests:XCTestCase {
         d.disconnect(reason:nil)
     }
 
+    func testBudgetInspectionDoesNotResetProcessLifetimeOrReuseIDs() {
+        var now=0.0;let budget=PilotRequestBudget(limit:4,lifetime:60,clock:{now})
+        XCTAssertEqual(budget.state.deadline,60);XCTAssertEqual(budget.state.remainingRequests,4)
+        XCTAssertEqual(budget.allocate(),1);now=49
+        XCTAssertEqual(budget.state.deadline,60);XCTAssertEqual(budget.state.remainingRequests,3)
+        XCTAssertEqual(budget.allocate(),2);now=60
+        XCTAssertEqual(budget.state.remainingRequests,0);XCTAssertEqual(budget.state.deadline,60);XCTAssertNil(budget.allocate())
+    }
+
+    func testAllocationAtomicallyPreservesTwoCleanupIDsDespiteStaleAdmissionSnapshots() {
+        let budget=PilotRequestBudget(limit:4,lifetime:60,clock:{0})
+        let staleAdmissions=(0..<3).map {_ in budget.state.remainingRequests>2}
+        XCTAssertEqual(staleAdmissions,[true,true,true])
+        let ids=staleAdmissions.map {_ in budget.allocate(reserving:2)}
+        XCTAssertEqual(ids[0],1);XCTAssertEqual(ids[1],2);XCTAssertNil(ids[2])
+        XCTAssertEqual(budget.state.remainingRequests,2)
+        XCTAssertEqual(budget.allocate(),3);XCTAssertEqual(budget.allocate(),4);XCTAssertNil(budget.allocate())
+    }
+
 }
