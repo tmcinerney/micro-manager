@@ -101,22 +101,43 @@ public final class WLDevice {
     private var emulatedConnected = false
     private var manager: IOHIDManager?
     private var device: IOHIDDevice?
-    private var inputBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: reportSize)
+    private final class ConnectionContext {
+        weak var owner:WLDevice?
+        let generation:UInt64
+        let buffer=UnsafeMutablePointer<UInt8>.allocate(capacity:WLDevice.reportSize)
+        init(_ owner:WLDevice,_ generation:UInt64) {self.owner=owner;self.generation=generation}
+        deinit {buffer.deallocate()}
+    }
+    // Keep callback contexts alive until this transport is destroyed; queued work captures its generation.
+    private var contexts:[ConnectionContext]=[]
+    private let generationLock=NSLock()
+    private var generationValue:UInt64=0
+    public var connectionGeneration:UInt64 {generationLock.lock();defer {generationLock.unlock()};return generationValue}
+    private let selector:PilotDeviceSelector?
+    private let pilotBudget:PilotRequestBudget?
+    private struct Pending {let generation:UInt64;let ticket:UUID;let done:(Any?,String?)->Void}
     private var rpcAccumulator = ""
     private var debugAccumulator = ""
-    private var pending: [Int: (Any?, String?) -> Void] = [:]
+    private var pending: [Int: Pending] = [:]
     private var nextID = 1
 
     public var isConnected: Bool { device != nil || emulatedConnected }
 
-    public init(emulator: PadEmulator? = nil) { self.emulator = emulator }
+    public init(emulator: PadEmulator? = nil) {self.emulator=emulator;selector=nil;pilotBudget=nil}
+    /// Pilot IDs are process-wide and never reset by reconnecting or replacing a WLDevice.
+    public init(pilotSelector: PilotDeviceSelector) {emulator=nil;selector=pilotSelector;pilotBudget = .process}
+    init(emulator:PadEmulator,budget:PilotRequestBudget) {self.emulator=emulator;selector=nil;pilotBudget=budget}
 
-    deinit { inputBuffer.deallocate() }
+    deinit {
+        if let device {IOHIDDeviceUnscheduleFromRunLoop(device,CFRunLoopGetMain(),CFRunLoopMode.defaultMode.rawValue);IOHIDDeviceClose(device,0)}
+        if let manager {IOHIDManagerClose(manager,0)}
+    }
 
     // MARK: - Connect
 
     public func connect() throws {
         disconnect(reason: nil)
+        let generation=connectionGeneration
 
         if let emulator {
             emulatedConnected = true
@@ -130,7 +151,10 @@ public final class WLDevice {
             )
             emulator.onNotify = { [weak self] method, params in
                 guard let self else { return }
-                DispatchQueue.main.async { self.onNotification?(method, params) }
+                DispatchQueue.main.async {
+                    guard self.isConnected,self.connectionGeneration==generation else {return}
+                    self.onNotification?(method,params)
+                }
             }
             return
         }
@@ -147,21 +171,29 @@ public final class WLDevice {
         IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
 
         guard let set = IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice>, !set.isEmpty else {
-            throw Failure.notFound
+            disconnect(reason:nil);throw Failure.notFound
         }
         // Over Bluetooth the pad is a single IOHIDDevice whose primary usage is
         // keyboard, with the vendor collection alongside it in DeviceUsagePairs.
         // Over USB each interface is its own IOHIDDevice, so picking the first
         // match lands on the keyboard and every report id 6 write is dropped.
         // Select the one that actually carries the vendor collection.
-        guard let dev = set.first(where: { primaryUsagePage($0) == WLDevice.vendorUsagePage })
-            ?? set.first(where: { hasVendorCollection($0) })
-        else {
-            throw Failure.noVendorCollection
-        }
+        let dev:IOHIDDevice
+        if let selector {
+            let devices=Array(set)
+            let candidates=devices.map {d in
+                PilotDeviceSelector.Candidate(vendorID:number(d,kIOHIDVendorIDKey) ?? 0,
+                    productID:number(d,kIOHIDProductIDKey) ?? 0,usagePage:hasExactVendorCollection(d) ? WLDevice.vendorUsagePage : 0,
+                    usage:hasExactVendorCollection(d) ? WLDevice.vendorUsage : 0,
+                    serial:string(d,kIOHIDSerialNumberKey) ?? "",transport:string(d,kIOHIDTransportKey) ?? "")
+            }
+            do {dev=devices[try selector.index(in:candidates)]}
+            catch {disconnect(reason:nil);throw error}
+        } else if let selected=set.first(where:{primaryUsagePage($0)==WLDevice.vendorUsagePage}) ?? set.first(where:{hasVendorCollection($0)}) {dev=selected}
+        else {disconnect(reason:nil);throw Failure.noVendorCollection}
 
         let result = IOHIDDeviceOpen(dev, IOOptionBits(kIOHIDOptionsTypeNone))
-        guard result == kIOReturnSuccess else { throw Failure.openFailed(result) }
+        guard result == kIOReturnSuccess else {disconnect(reason:nil);throw Failure.openFailed(result)}
 
         device = dev
         info = Info(
@@ -173,48 +205,57 @@ public final class WLDevice {
             interfaceCount: set.count
         )
 
-        let context = Unmanaged.passUnretained(self).toOpaque()
-        IOHIDDeviceRegisterInputReportCallback(dev, inputBuffer, WLDevice.reportSize, { ctx, _, _, _, reportID, report, length in
-            guard let ctx, length > 0 else { return }
-            let me = Unmanaged<WLDevice>.fromOpaque(ctx).takeUnretainedValue()
-            let bytes = Array(UnsafeBufferPointer(start: report, count: Int(length)))
-            DispatchQueue.main.async { me.handleReport(bytes, reportID: reportID) }
-        }, context)
-
-        IOHIDDeviceRegisterRemovalCallback(dev, { ctx, _, _ in
-            guard let ctx else { return }
-            let me = Unmanaged<WLDevice>.fromOpaque(ctx).takeUnretainedValue()
-            DispatchQueue.main.async { me.disconnect(reason: "device removed") }
-        }, context)
+        let connection=ConnectionContext(self,generation)
+        contexts.append(connection)
+        let context=Unmanaged.passUnretained(connection).toOpaque()
+        IOHIDDeviceRegisterInputReportCallback(dev,connection.buffer,WLDevice.reportSize,{ctx,_,_,_,reportID,report,length in
+            guard let ctx,length>0 else {return}
+            let connection=Unmanaged<ConnectionContext>.fromOpaque(ctx).takeUnretainedValue()
+            let bytes=Array(UnsafeBufferPointer(start:report,count:Int(length)))
+            connection.owner?.enqueueReport(bytes,reportID:reportID,generation:connection.generation)
+        },context)
+        IOHIDDeviceRegisterRemovalCallback(dev,{ctx,_,_ in
+            guard let ctx else {return}
+            let connection=Unmanaged<ConnectionContext>.fromOpaque(ctx).takeUnretainedValue()
+            connection.owner?.enqueueRemoval(generation:connection.generation)
+        },context)
 
         IOHIDDeviceScheduleWithRunLoop(dev, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
     }
 
     public func disconnect(reason: String?) {
-        if emulator != nil {
-            guard emulatedConnected else { return }
-            emulatedConnected = false
-            emulator?.onNotify = nil
-            info = nil
-            for (_, done) in pending { done(nil, "disconnected") }
-            pending.removeAll()
-            if let reason { onDisconnect?(reason) }
-            return
+        generationLock.lock();generationValue &+= 1;generationLock.unlock()
+        let wasConnected=isConnected
+        emulatedConnected=false;emulator?.onNotify=nil
+        if let dev=device {
+            IOHIDDeviceUnscheduleFromRunLoop(dev,CFRunLoopGetMain(),CFRunLoopMode.defaultMode.rawValue)
+            IOHIDDeviceClose(dev,IOOptionBits(kIOHIDOptionsTypeNone))
         }
-        guard let dev = device else { return }
-        IOHIDDeviceUnscheduleFromRunLoop(dev, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
-        IOHIDDeviceClose(dev, IOOptionBits(kIOHIDOptionsTypeNone))
-        device = nil
-        if let mgr = manager {
-            IOHIDManagerClose(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
-            manager = nil
+        device=nil
+        if let mgr=manager {IOHIDManagerClose(mgr,IOOptionBits(kIOHIDOptionsTypeNone))}
+        manager=nil;info=nil;rpcAccumulator="";debugAccumulator=""
+        let retired=Array(pending.values);pending.removeAll()
+        for waiting in retired {waiting.done(nil,"disconnected")}
+        if wasConnected,let reason {onDisconnect?(reason)}
+    }
+    func enqueueReport(_ bytes:[UInt8],reportID:UInt32,generation:UInt64) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self,self.isConnected,self.connectionGeneration==generation else {return}
+            self.handleReport(bytes,reportID:reportID,generation:generation)
         }
-        info = nil
-        rpcAccumulator = ""
-        debugAccumulator = ""
-        for (_, done) in pending { done(nil, "disconnected") }
-        pending.removeAll()
-        if let reason { onDisconnect?(reason) }
+    }
+    func enqueueRemoval(generation:UInt64) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self,self.isConnected,self.connectionGeneration==generation else {return}
+            self.disconnect(reason:"device removed")
+        }
+    }
+    func requestTicket(_ id:Int)->UUID? {pending[id]?.ticket}
+    func expireRequest(_ id:Int,ticket:UUID,generation:UInt64,method:String) {
+        guard connectionGeneration==generation,let waiting=pending[id],waiting.ticket==ticket else {return}
+        pending.removeValue(forKey:id)
+        waiting.done(nil,Failure.timeout(method).errorDescription)
+        if pilotBudget != nil {disconnect(reason:"pilot reply timeout; request retired")}
     }
 
     // MARK: - Send
@@ -227,8 +268,19 @@ public final class WLDevice {
         }
 
         // Firmware only accepts call ids below 1000.
-        let id = nextID
-        nextID = nextID % 998 + 1
+        let generation=connectionGeneration,ticket=UUID()
+        let id:Int
+        if let pilotBudget {
+            guard let allocated=pilotBudget.allocate() else {
+                completion?(nil,"pilot request budget exhausted");disconnect(reason:"pilot request budget exhausted");return nil
+            }
+            id=allocated
+        } else {id=nextID;nextID=nextID % 998 + 1}
+        let done=completion ?? {_,_ in}
+        pending[id]=Pending(generation:generation,ticket:ticket,done:done)
+        DispatchQueue.main.asyncAfter(deadline:.now()+(pilotBudget == nil ? 8:2)) { [weak self] in
+            self?.expireRequest(id,ticket:ticket,generation:generation,method:method)
+        }
 
         if let emulator {
             onTX?(method, params, id)
@@ -237,9 +289,13 @@ public final class WLDevice {
             // would work here and deadlock on hardware.
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
-                let (result, error) = emulator.handle(method, params: params)
-                self.onResponse?(id, result, error)
-                completion?(result, error)
+                guard self.isConnected,self.connectionGeneration==generation,
+                    let waiting=self.pending[id],waiting.ticket==ticket else {return}
+                let (result,error)=emulator.handle(method,params:params)
+                guard self.connectionGeneration==generation else {return}
+                self.pending.removeValue(forKey:id)
+                self.onResponse?(id,result,error)
+                waiting.done(result,error)
             }
             return id
         }
@@ -253,6 +309,7 @@ public final class WLDevice {
         message["params"] = params ?? NSNull()
 
         guard let data = try? JSONSerialization.data(withJSONObject: message, options: [.sortedKeys]) else {
+            pending.removeValue(forKey:id)
             completion?(nil, "could not encode params")
             return nil
         }
@@ -274,8 +331,10 @@ public final class WLDevice {
                 // Surface the failure rather than dropping it: a silent write
                 // error is indistinguishable from a device that ignores you.
                 let message = Failure.writeFailed(rc).errorDescription ?? "write failed"
-                onWriteError?(method, message)
-                completion?(nil, message)
+                pending.removeValue(forKey:id)
+                onWriteError?(method,message)
+                completion?(nil,message)
+                if pilotBudget != nil {disconnect(reason:"pilot write failed")}
                 return nil
             }
             offset += n
@@ -283,20 +342,14 @@ public final class WLDevice {
 
         onTX?(method, params, id)
 
-        if let completion {
-            pending[id] = completion
-            DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
-                guard let self, let waiting = self.pending.removeValue(forKey: id) else { return }
-                waiting(nil, Failure.timeout(method).errorDescription)
-            }
-        }
         return id
     }
 
     // MARK: - Receive
 
-    private func handleReport(_ bytes: [UInt8], reportID: UInt32) {
-        onRawReport?(reportID, bytes)
+    private func handleReport(_ bytes: [UInt8], reportID: UInt32, generation:UInt64) {
+        onRawReport?(reportID,bytes)
+        guard isConnected,connectionGeneration==generation else {return}
         // The input callback delivers the report id out-of-band, so the
         // payload normally starts at index 0 — but be tolerant of stacks that
         // include it, and try the shifted alignment too.
@@ -325,14 +378,20 @@ public final class WLDevice {
         }
 
         rpcAccumulator += text
+        let cap=pilotBudget == nil ? 8192:262_144
+        guard rpcAccumulator.utf8.count<=cap else {
+            rpcAccumulator=""
+            if pilotBudget != nil {disconnect(reason:"pilot response exceeds 256 KiB")}
+            return true
+        }
         drainRPC()
-        if rpcAccumulator.count > 8192 { rpcAccumulator = "" }
         return true
     }
 
     /// Pulls complete top-level JSON objects out of the accumulator.
     private func drainRPC() {
-        while let object = nextJSONObject() {
+        let generation=connectionGeneration
+        while isConnected,connectionGeneration==generation,let object = nextJSONObject() {
             guard
                 let data = object.data(using: .utf8),
                 let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
@@ -341,8 +400,13 @@ public final class WLDevice {
             if let id = decoded["id"] as? Int {
                 let error = (decoded["error"] as? [String: Any])?["message"] as? String
                 let result = decoded["result"]
-                onResponse?(id, result, error)
-                if let waiting = pending.removeValue(forKey: id) { waiting(result, error) }
+                if let waiting=pending.removeValue(forKey:id),waiting.generation==generation {
+                    onResponse?(id,result,error)
+                    waiting.done(result,error)
+                } else if pilotBudget == nil {
+                    // Preserve the inspector's raw response diagnostics outside the bounded pilot.
+                    onResponse?(id,result,error)
+                }
             } else if let method = (decoded["m"] as? String) ?? (decoded["method"] as? String) {
                 // Device-pushed notification. Note the envelope is abbreviated
                 // here - {"m": method, "p": params} - while responses use the
@@ -399,6 +463,12 @@ public final class WLDevice {
 
     private func primaryUsagePage(_ dev: IOHIDDevice) -> Int? {
         number(dev, kIOHIDPrimaryUsagePageKey)
+    }
+
+    private func hasExactVendorCollection(_ dev:IOHIDDevice)->Bool {
+        if primaryUsagePage(dev)==WLDevice.vendorUsagePage && number(dev,kIOHIDPrimaryUsageKey)==WLDevice.vendorUsage {return true}
+        guard let pairs=IOHIDDeviceGetProperty(dev,kIOHIDDeviceUsagePairsKey as CFString) as? [[String:Any]] else {return false}
+        return pairs.contains {($0[kIOHIDDeviceUsagePageKey] as? Int)==WLDevice.vendorUsagePage && ($0[kIOHIDDeviceUsageKey] as? Int)==WLDevice.vendorUsage}
     }
 
     /// True when this IOHIDDevice exposes the vendor collection, either as its
