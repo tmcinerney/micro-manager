@@ -11,6 +11,7 @@ extension WLDevice {
         let generation=expectedGeneration ?? connectionGeneration
         return try await withCheckedThrowingContinuation { continuation in
             var resumed = false
+            var rpcCode:Int?
             let finish: (Result<Any?, Error>) -> Void = { result in
                 guard !resumed else { return }
                 resumed = true
@@ -20,9 +21,9 @@ extension WLDevice {
                 guard self.connectionGeneration==generation,self.isConnected else {
                     finish(.failure(WLDevice.Failure.notConnected));return
                 }
-                let sent = self.call(method, params: params) { result, error in
+                let sent = self.callReportingRPCError(method, params: params, rpcErrorCode:{rpcCode=$0}) { result, error in
                     if let error {
-                        finish(.failure(WLDevice.Failure.rpc(method, error)))
+                        finish(.failure(WLDevice.Failure.rpc(method, error, rpcCode)))
                     } else {
                         finish(.success(result))
                     }

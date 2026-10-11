@@ -1,4 +1,5 @@
 import Foundation
+import CoreFoundation
 import IOKit
 import IOKit.hid
 
@@ -47,7 +48,7 @@ public final class WLDevice {
         case notConnected
         case writeFailed(IOReturn)
         case timeout(String)
-        case rpc(String, String)
+        case rpc(String, String, Int? = nil)
 
         public var errorDescription: String? {
             switch self {
@@ -76,8 +77,8 @@ public final class WLDevice {
                 return String(format: "IOHIDDeviceSetReport failed (0x%08X)", code) + name
             case .timeout(let m):
                 return "Timed out waiting for \(m)."
-            case .rpc(let method, let message):
-                return "\(method): \(message)"
+            case .rpc(let method, let message, let code):
+                return "\(method): \(message)" + (code.map {"; rpcCode=\($0)"} ?? "; rpcCode=unavailable")
             }
         }
     }
@@ -115,7 +116,7 @@ public final class WLDevice {
     public var connectionGeneration:UInt64 {generationLock.lock();defer {generationLock.unlock()};return generationValue}
     private let selector:PilotDeviceSelector?
     private let pilotBudget:PilotRequestBudget?
-    private struct Pending {let generation:UInt64;let ticket:UUID;let done:(Any?,String?)->Void}
+    private struct Pending {let generation:UInt64;let ticket:UUID;let done:(Any?,String?)->Void;let rpcErrorCode:((Int?)->Void)?}
     private var rpcAccumulator = ""
     private var debugAccumulator = ""
     private var pending: [Int: Pending] = [:]
@@ -261,7 +262,12 @@ public final class WLDevice {
     // MARK: - Send
 
     @discardableResult
-    public func call(_ method: String, params: Any?, completion: ((Any?, String?) -> Void)? = nil) -> Int? {
+    public func call(_ method:String,params:Any?,completion:((Any?,String?)->Void)?=nil) -> Int? {
+        callReportingRPCError(method,params:params,rpcErrorCode:nil,completion:completion)
+    }
+
+    @discardableResult
+    public func callReportingRPCError(_ method: String, params: Any?, rpcErrorCode: ((Int?)->Void)?, completion: ((Any?, String?) -> Void)? = nil) -> Int? {
         guard emulatedConnected || device != nil else {
             completion?(nil, Failure.notConnected.errorDescription)
             return nil
@@ -277,7 +283,7 @@ public final class WLDevice {
             id=allocated
         } else {id=nextID;nextID=nextID % 998 + 1}
         let done=completion ?? {_,_ in}
-        pending[id]=Pending(generation:generation,ticket:ticket,done:done)
+        pending[id]=Pending(generation:generation,ticket:ticket,done:done,rpcErrorCode:rpcErrorCode)
         DispatchQueue.main.asyncAfter(deadline:.now()+(pilotBudget == nil ? 8:2)) { [weak self] in
             self?.expireRequest(id,ticket:ticket,generation:generation,method:method)
         }
@@ -389,6 +395,14 @@ public final class WLDevice {
     }
 
     /// Pulls complete top-level JSON objects out of the accumulator.
+    static func matchedRPCErrorCode(_ decoded:[String:Any]) -> Int? {
+        guard let n=(decoded["error"] as? [String:Any])?["code"] as? NSNumber,
+              CFGetTypeID(n) != CFBooleanGetTypeID(),n.doubleValue.isFinite,
+              n.doubleValue>=Double(Int32.min),n.doubleValue<=Double(Int32.max),
+              n.doubleValue==Double(n.intValue) else {return nil}
+        return n.intValue
+    }
+
     private func drainRPC() {
         let generation=connectionGeneration
         while isConnected,connectionGeneration==generation,let object = nextJSONObject() {
@@ -402,6 +416,7 @@ public final class WLDevice {
                 let result = decoded["result"]
                 if let waiting=pending.removeValue(forKey:id),waiting.generation==generation {
                     onResponse?(id,result,error)
+                    if error != nil {waiting.rpcErrorCode?(Self.matchedRPCErrorCode(decoded))}
                     waiting.done(result,error)
                 } else if pilotBudget == nil {
                     // Preserve the inspector's raw response diagnostics outside the bounded pilot.

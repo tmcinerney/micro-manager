@@ -88,4 +88,22 @@ final class PilotTransportTests:XCTestCase {
         XCTAssertEqual(payloadLength,13_298);d.disconnect(reason:nil)
     }
 
+    @MainActor func testMatchedDeviceErrorCodeSurvivesAsync() async throws {
+        let d=WLDevice(emulator:PadEmulator());try d.connect()
+        d.onTX={_,_,id in
+            let wire=Array("{\"id\":\(id),\"error\":{\"code\":-32000,\"message\":\"json pool overflow\"}}".utf8)
+            for i in stride(from:0,to:wire.count,by:61) {
+                let chunk=Array(wire[i..<min(i+61,wire.count)])
+                d.enqueueReport([2,UInt8(chunk.count)]+chunk,reportID:6,generation:d.connectionGeneration)
+            }
+        }
+        do {_ = try await d.callAsync("fs.readbin",params:["len":192]);XCTFail("Expected device error")}
+        catch let e as WLDevice.Failure {
+            guard case .rpc(let method,let message,let code)=e else {return XCTFail("Wrong failure")}
+            XCTAssertEqual(method,"fs.readbin");XCTAssertEqual(message,"json pool overflow");XCTAssertEqual(code,-32000)
+        }
+        for code:Any in [true,1.5,"-32000",Double.infinity] {XCTAssertNil(WLDevice.matchedRPCErrorCode(["error":["code":code]]))}
+        d.disconnect(reason:nil)
+    }
+
 }
