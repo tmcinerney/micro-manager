@@ -33,11 +33,20 @@ public struct PilotDeviceSelector: Equatable {
 public final class PilotRequestBudget {
     public static let process = PilotRequestBudget()
     private var next=1
-    private let limit:Int, lifetime:Double
+    private var limit:Int, lifetime:Double
     private var started:Double?
     private let clock:()->Double
     public convenience init() {self.init(limit:256,lifetime:60,clock:{ProcessInfo.processInfo.systemUptime})}
     init(limit:Int,lifetime:Double,clock:@escaping ()->Double) {self.limit=min(limit,998);self.lifetime=lifetime;self.clock=clock}
+    /// Explicit configuration mode, only before this process has sent any pilot request.
+    /// Does not reset IDs, extend an active lifetime or permit a second configuration.
+    public func configureSingleKeyMutationBeforeFirstRequest() throws {
+        lock.lock();defer {lock.unlock()}
+        guard started==nil,next==1,limit==256,lifetime==60 else {
+            throw NSError(domain:"WLKit.PilotBudget",code:1,userInfo:[NSLocalizedDescriptionKey:"Configuration budget must be selected before first request"])
+        }
+        limit=768;lifetime=120
+    }
     public struct State {public let deadline:Double,remainingRequests:Int}
     /// Read-only process budget; reconnecting never resets IDs or lifetime.
     public var state:State {

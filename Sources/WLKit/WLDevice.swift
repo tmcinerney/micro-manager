@@ -86,6 +86,10 @@ public final class WLDevice {
     // Callbacks, always delivered on the main queue.
     public var onTX: ((String, Any?, Int) -> Void)?          // method, params, id
     public var pilotBudgetState:PilotRequestBudget.State? {pilotBudget?.state}
+    public func configureSingleKeyMutationBeforeFirstRequest() throws {
+        guard let pilotBudget else {throw NSError(domain:"WLKit.PilotBudget",code:2,userInfo:[NSLocalizedDescriptionKey:"Pilot device required"])}
+        try pilotBudget.configureSingleKeyMutationBeforeFirstRequest()
+    }
     public var onResponse: ((Int, Any?, String?) -> Void)?   // id, result, errorMessage
     public var onNotification: ((String, Any?) -> Void)?     // method, params
     public var onDeviceLog: ((String) -> Void)?

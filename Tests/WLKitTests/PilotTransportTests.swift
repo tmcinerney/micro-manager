@@ -125,4 +125,19 @@ final class PilotTransportTests:XCTestCase {
         XCTAssertEqual(budget.allocate(),3);XCTAssertEqual(budget.allocate(),4);XCTAssertNil(budget.allocate())
     }
 
+    func testConfigurationBudgetSelectedOnceBeforeFirstRequestWithoutReset() throws {
+        var now=0.0
+        let budget=PilotRequestBudget(limit:256,lifetime:60,clock:{now})
+        try budget.configureSingleKeyMutationBeforeFirstRequest()
+        XCTAssertEqual(budget.state.remainingRequests,768)
+        XCTAssertThrowsError(try budget.configureSingleKeyMutationBeforeFirstRequest())
+        XCTAssertEqual(budget.allocate(reserving:300),1)
+        now=119;XCTAssertEqual(budget.state.deadline,120)
+        XCTAssertThrowsError(try budget.configureSingleKeyMutationBeforeFirstRequest())
+        now=120;XCTAssertNil(budget.allocate())
+        let used=PilotRequestBudget(limit:256,lifetime:60,clock:{0})
+        XCTAssertEqual(used.allocate(),1)
+        XCTAssertThrowsError(try used.configureSingleKeyMutationBeforeFirstRequest())
+        XCTAssertEqual(used.allocate(),2)
+    }
 }
