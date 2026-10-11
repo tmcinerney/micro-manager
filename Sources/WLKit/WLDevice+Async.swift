@@ -7,18 +7,23 @@ extension WLDevice {
     /// and schedules its timeout there, and input reports are delivered there
     /// too, so keeping every access on one queue is what makes the table safe
     /// without locking.
-    public func callAsync(_ method: String, params: Any? = nil) async throws -> Any? {
-        try await withCheckedThrowingContinuation { continuation in
+    public func callAsync(_ method: String, params: Any? = nil, expectedGeneration: UInt64? = nil, reserving:Int=0) async throws -> Any? {
+        let generation=expectedGeneration ?? connectionGeneration
+        return try await withCheckedThrowingContinuation { continuation in
             var resumed = false
+            var rpcCode:Int?
             let finish: (Result<Any?, Error>) -> Void = { result in
                 guard !resumed else { return }
                 resumed = true
                 continuation.resume(with: result)
             }
             DispatchQueue.main.async {
-                let sent = self.call(method, params: params) { result, error in
+                guard self.connectionGeneration==generation,self.isConnected else {
+                    finish(.failure(WLDevice.Failure.notConnected));return
+                }
+                let sent = self.callReportingRPCError(method, params: params, rpcErrorCode:{rpcCode=$0},reserving:reserving) { result, error in
                     if let error {
-                        finish(.failure(WLDevice.Failure.rpc(method, error)))
+                        finish(.failure(WLDevice.Failure.rpc(method, error, rpcCode)))
                     } else {
                         finish(.success(result))
                     }
